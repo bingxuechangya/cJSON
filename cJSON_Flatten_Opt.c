@@ -13,35 +13,42 @@
 
 #include "cJSON.h"
 
-#define CONF_MAX_SZ 4096
+#define CONF_MAX_SZ 8192
 static int g_value_in_subnode = 0;
 
-cJSON *cJSON_ParseFile(const char *file)
+cJSON *cJSON_Parse_File_Len(const char *file, size_t *file_len)
 {
-	cJSON *json;
-	FILE *fp;
-	char *buf;
-	unsigned long len;
+	cJSON *json = NULL;
+	FILE *fp = NULL;
+	char *buf = NULL;
+	unsigned long len = 0;
+
 	fp = fopen(file, "rb");
-	if (fp == NULL) return NULL;
+	if (fp == NULL) goto end;
 
 	fseek(fp, 0, SEEK_END);
 	len = (unsigned long)ftell(fp);
 	if (len >= 8 * 1024 * 1024) {
-		fclose(fp);
-		return NULL;
+		goto end;
 	}
 	fseek(fp, 0, SEEK_SET);
 	buf = (char *)malloc(len);
 	if (buf == NULL) {
-		fclose(fp);
-		return NULL;
+		goto end;
 	}
 	fread(buf, 1, len, fp);
-	fclose(fp);
 	json = cJSON_Parse(buf);
-	free(buf);
+end:
+	if (file_len) *file_len = len;
+	if (fp) fclose(fp);
+	if (buf) free(buf);
 	return json;
+}
+
+cJSON *cJSON_ParseFile(const char *file)
+{
+	size_t len;
+	return cJSON_Parse_File_Len(file, &len);
 }
 
 int cJSON_WriteFile(const char *file,cJSON *json)
@@ -312,37 +319,38 @@ static int cJSON_Parse_Value_Set_Env(const char *type, char *conf __attribute__(
 	return 0;
 }
 
-char *cJSON_TO_Conf(cJSON *object);
-char *cJSON_TO_Conf(cJSON *object)
+char *cJSON_TO_Conf(char *json_file);
+char *cJSON_TO_Conf(char *json_file)
 {
-	char *conf = calloc(1, CONF_MAX_SZ);
-	cJSON_Parse_Value(conf, CONF_MAX_SZ, object, cJSON_Parse_Value_Conf_Join);
+	cJSON *json_obj;
+	char *conf;
+	size_t file_len;
+
+	json_obj = cJSON_Parse_File_Len(json_file, &file_len);
+	if (json_obj == NULL) {
+		printf("err\n");
+		return 0;
+	}
+	conf = calloc(1, file_len);
+	cJSON_Parse_Value(conf, file_len, json_obj, cJSON_Parse_Value_Conf_Join);
+	cJSON_Delete(json_obj);
 	return conf;
 }
 
 #if 0
 int main(int argc, char *argv[])
 {
-	cJSON *json_obj;
-	char *conf;
-	json_obj = cJSON_ParseFile("webcfg.json");
-	if (json_obj == NULL) {
-		printf("err\n");
-		return 0;
-	}
-
-	conf = cJSON_TO_Conf(json_obj);
-	cJSON_Delete(json_obj);
+	char *conf = cJSON_TO_Conf(argv[1]);
 	puts(conf);
 	free(conf);
 	return 0;
 }
 #endif
 
-int cJSON_Update_By_Conf(cJSON *object, const char *conf);
-int cJSON_Update_By_Conf(cJSON *object, const char *conf)
+int cJSON_Update_By_Conf(cJSON *object, const char *conf, size_t conf_len);
+int cJSON_Update_By_Conf(cJSON *object, const char *conf, size_t conf_len)
 {
-	return cJSON_Parse_Value((char*)conf, CONF_MAX_SZ, object, cJSON_Parse_Value_Update);
+	return cJSON_Parse_Value((char*)conf, conf_len, object, cJSON_Parse_Value_Update);
 }
 
 int cJSON_Env_Exec(cJSON *object, char *prog);
@@ -394,16 +402,17 @@ int cJSON_Set_Env_Exec(int args_num, char **args)
 	prog_argv[args_num+1] = NULL;
 
 	execv(prog, prog_argv);
+	return 0;
 }
 
 int cJSON_Set_Env_Shell(char *json_file, char *cmdline)
 {
-	int ret;
 	cJSON *obj = NULL;
 	FILE *fp = NULL;
 	char *conf = NULL;
+	size_t file_len;
 
-	obj = cJSON_ParseFile(json_file);
+	obj = cJSON_Parse_File_Len(json_file, &file_len);
 	if (obj == NULL) {
 		fprintf(stderr, "Failed to parse json file: %s\n", json_file);
 		return -1;
@@ -414,14 +423,14 @@ int cJSON_Set_Env_Shell(char *json_file, char *cmdline)
 		fprintf(stderr, "Failed to create temp file!\n");
 		goto fail;
 	}
-	conf = calloc(1, CONF_MAX_SZ);
+	conf = calloc(1, file_len);
 	if (conf == NULL) {
 		fprintf(stderr, "Failed to calloc memory!\n");
 		goto fail;
 	}
 
 	// 把旧的old_obj json压平导出到conf
-	int len = cJSON_Parse_Value(conf, CONF_MAX_SZ, obj, cJSON_Parse_Value_Conf_Join);
+	int len = cJSON_Parse_Value(conf, file_len, obj, cJSON_Parse_Value_Conf_Join);
 	if (len <= 0) {
 		fprintf(stderr, "No content in json!\n");
 		goto fail;
@@ -457,13 +466,21 @@ int cJSON_Set_Env_Shell(char *json_file, char *cmdline)
 		int wstatus;
 		pid_t w;
 		while(1) {
-
-			sleep(1);
-
+			int wait_cnt;
+			// sleep(1);
+			usleep(10000);
 			w = waitpid(pid, &wstatus, WUNTRACED | WCONTINUED | WNOHANG);
 			if (w == -1) {
 				goto fail;
 			}
+			if (WIFEXITED(wstatus)) {
+				goto fail;
+			}
+			// 每10毫秒检查一次pid，每3秒检查一次json文件
+			if (wait_cnt++ < 300) {
+				continue;
+			}
+			wait_cnt = 0;
 
 			if (stat(json_file, &attrib) < 0) {
 				continue;
@@ -474,14 +491,14 @@ int cJSON_Set_Env_Shell(char *json_file, char *cmdline)
 			// printf("Update! %ld, %ld\n", update_time, attrib.st_mtime);
 			update_time = attrib.st_mtime;
 
-			obj = cJSON_ParseFile(json_file);
+			obj = cJSON_Parse_File_Len(json_file, &file_len);
 			if (obj == NULL) {
 				continue;
 			}
 			// puts("?@1");
-			memset(conf, 0, CONF_MAX_SZ);
+			memset(conf, 0, file_len);
 			// 把旧的old_obj json压平导出到conf
-			int len = cJSON_Parse_Value(conf, CONF_MAX_SZ, obj, cJSON_Parse_Value_Conf_Join);
+			int len = cJSON_Parse_Value(conf, file_len, obj, cJSON_Parse_Value_Conf_Join);
 			// puts("?@2");
 			if (len <= 0) {
 				// puts("?@3");
@@ -516,6 +533,7 @@ fail:
 	if (fp) fclose(fp);
 	if (conf) free(conf);
 	if (obj) cJSON_Delete(obj);
+	return -1;
 }
 
 #if 0
@@ -537,7 +555,7 @@ int main(int argc, char *argv[])
 		".remote.ntp_server=192.168.1.220\n";
 	cJSON *json_obj;
 	json_obj = cJSON_ParseFile("webcfg.json");
-	cJSON_Update_By_Conf(json_obj, conf);
+	cJSON_Update_By_Conf(json_obj, conf, strlen(conf)+1);
 	puts(cJSON_Print(json_obj));
 
 	cJSON_Env_Exec(json_obj, argv[1]);
@@ -562,8 +580,9 @@ int cJSON_Print_Only(char *json_file)
 int cJSON_Update_By_JSON(char *old_json_file, char *new_default_json_file, char *new_json_file)
 {
 	char fname[256];
+	size_t file_len1, file_len2, conf_len;
 	cJSON *old_obj, *new_obj;
-	new_obj = cJSON_ParseFile(new_default_json_file);
+	new_obj = cJSON_Parse_File_Len(new_default_json_file, &file_len2);
 	if (new_obj == NULL) {
 		fprintf(stderr, "Cannot parse %s\n", new_default_json_file);
 		return -1;
@@ -575,24 +594,26 @@ int cJSON_Update_By_JSON(char *old_json_file, char *new_default_json_file, char 
 		old_json_file = fname;
 	}
 	// puts(cJSON_Print(new_obj));
-	old_obj = cJSON_ParseFile(old_json_file);
+	old_obj = cJSON_Parse_File_Len(old_json_file, &file_len1);
 	if (old_obj == NULL) {
 		cJSON_WriteFile(new_json_file, new_obj);
 		cJSON_Delete(new_obj);
 		return 0;
 	}
+
+	conf_len = file_len2 > file_len1 ? file_len2 : file_len1;
 	// puts(cJSON_Print(old_obj));
 
-	char *conf = calloc(1, CONF_MAX_SZ);
+	char *conf = calloc(1, conf_len);
 
 	// 把旧的old_obj json压平导出到conf
-	cJSON_Parse_Value(conf, CONF_MAX_SZ, old_obj, cJSON_Parse_Value_Conf_Join);
+	cJSON_Parse_Value(conf, conf_len, old_obj, cJSON_Parse_Value_Conf_Join);
 
 	// 用conf更新new_obj json
-	cJSON_Parse_Value(conf, CONF_MAX_SZ, new_obj, cJSON_Parse_Value_Update);
+	cJSON_Parse_Value(conf, conf_len, new_obj, cJSON_Parse_Value_Update);
 
 	// 打印更新后的 new_obj json
-	cJSON_Parse_Value(conf, CONF_MAX_SZ, new_obj, cJSON_Parse_Value_Print);
+	cJSON_Parse_Value(conf, conf_len, new_obj, cJSON_Parse_Value_Print);
 	cJSON_WriteFile(new_json_file, new_obj);
 
 	free(conf);
@@ -620,6 +641,9 @@ void Usage()
 "    --set-env-exec FILE.json PROGRAM [ARGS...]\n"
 "              把FILE.json压平后的内容加载成为环境变量，\n"
 "              然后带参数ARGS...运行 PROGRAM。\n"
+"    --set-env-shell FILE.json PROGRAM [ARGS...]\n"
+"              同 --set-env-exec，并且 json 内容变化可以通过tmpfile+\n"
+"              环境变量的方式被子进程的getenv重新获取到。\n"
 		   );
 		return;
 	}
@@ -639,6 +663,9 @@ void Usage()
 "    --set-env-exec FILE.json PROGRAM [ARGS...]\n"
 "              load flattened content of FILE.json as environment variables\n"
 "              then run PROGRAM with ARGS.\n"
+"    --set-env-shell FILE.json PROGRAM [ARGS...]\n"
+"              Same as --set-env-exec, but also the change of json can be updated into\n"
+"              subprogram by changing its environments, which can be got by getenv().\n"
 		   );
 }
 
@@ -646,7 +673,6 @@ int main(int argc, char *argv[])
 {
 	int flag = -1;
 	int opt_index = 0;
-	int i;
 
 	if (!strcmp(basename(argv[0]), "cjson_env_sh")) {
 		if (argc < 2) {
