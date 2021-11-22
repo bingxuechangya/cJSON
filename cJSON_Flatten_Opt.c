@@ -5,6 +5,11 @@
 #include <math.h>
 #include <unistd.h>
 #include <libgen.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <sys/file.h>
 
 #include "cJSON.h"
 
@@ -103,10 +108,10 @@ static int cJSON_Parse_Value_Internal(char *conf, size_t conf_len, char *keychai
 	// 处理数组，套用递归
 	if (((object->type) & 0xFF) == cJSON_Array) {
 		int index = 0;
-		char index_str[4];
+		char index_str[16];
 		while(c) {
 			newkey_start = keychain + strlen(keychain);
-			snprintf(index_str, sizeof(index_str), "%d", index++);
+			snprintf(index_str, sizeof(index_str), "[%d]", index++);
 			newkey_len = strlen(index_str);
 			sprintf(keychain, "%s%s", keychain, index_str);
 			// 对子节点递归执行
@@ -391,6 +396,128 @@ int cJSON_Set_Env_Exec(int args_num, char **args)
 	execv(prog, prog_argv);
 }
 
+int cJSON_Set_Env_Shell(char *json_file, char *cmdline)
+{
+	int ret;
+	cJSON *obj = NULL;
+	FILE *fp = NULL;
+	char *conf = NULL;
+
+	obj = cJSON_ParseFile(json_file);
+	if (obj == NULL) {
+		fprintf(stderr, "Failed to parse json file: %s\n", json_file);
+		return -1;
+	}
+
+	fp = tmpfile();
+	if (fp == NULL) {
+		fprintf(stderr, "Failed to create temp file!\n");
+		goto fail;
+	}
+	conf = calloc(1, CONF_MAX_SZ);
+	if (conf == NULL) {
+		fprintf(stderr, "Failed to calloc memory!\n");
+		goto fail;
+	}
+
+	// 把旧的old_obj json压平导出到conf
+	int len = cJSON_Parse_Value(conf, CONF_MAX_SZ, obj, cJSON_Parse_Value_Conf_Join);
+	if (len <= 0) {
+		fprintf(stderr, "No content in json!\n");
+		goto fail;
+	}
+	fwrite(conf, len, 1, fp);
+	fflush(fp);
+
+	char fileno_str[16];
+	int fd = fileno(fp);
+	snprintf(fileno_str, sizeof(fileno_str), "%d", fd);
+	setenv("CONFIG_FILE_NO", fileno_str, 1);
+	cJSON_Delete(obj);
+	obj = NULL;
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		fprintf(stderr, "Failed to create fork!\n");
+		goto fail;
+	}
+
+	if (pid == 0) {
+		if (cmdline == NULL) {
+			execl("/bin/sh", "", NULL);
+		} else {
+			char *exe = (char *)calloc(1, strlen(cmdline)+8);
+			sprintf(exe, "exec %s", cmdline);
+			execl("/bin/sh", "sh", "-c", exe, NULL);
+		}
+	} else {
+		struct stat attrib;
+		time_t update_time;
+		time(&update_time);
+		int wstatus;
+		pid_t w;
+		while(1) {
+
+			sleep(1);
+
+			w = waitpid(pid, &wstatus, WUNTRACED | WCONTINUED | WNOHANG);
+			if (w == -1) {
+				goto fail;
+			}
+
+			if (stat(json_file, &attrib) < 0) {
+				continue;
+			}
+			if (attrib.st_mtime <= update_time) {
+				continue;
+			}
+			// printf("Update! %ld, %ld\n", update_time, attrib.st_mtime);
+			update_time = attrib.st_mtime;
+
+			obj = cJSON_ParseFile(json_file);
+			if (obj == NULL) {
+				continue;
+			}
+			// puts("?@1");
+			memset(conf, 0, CONF_MAX_SZ);
+			// 把旧的old_obj json压平导出到conf
+			int len = cJSON_Parse_Value(conf, CONF_MAX_SZ, obj, cJSON_Parse_Value_Conf_Join);
+			// puts("?@2");
+			if (len <= 0) {
+				// puts("?@3");
+				fprintf(stderr, "No content in json!\n");
+				cJSON_Delete(obj);
+				obj = NULL;
+				continue;
+			}
+			// flock 不能跨进程生效
+			// puts("?@4");
+			struct flock fl = {
+				.l_type = F_WRLCK,
+				// 下面3个指明锁区域
+				.l_whence = SEEK_SET,
+				.l_start = 0,
+				.l_len = 0,
+				// 对所有进程上锁
+				.l_pid = 0
+			};
+			// F_SETLKW 中的 W 表示 wait
+			fcntl(fd, F_SETLKW, &fl);
+			rewind(fp);
+			fwrite(conf, len, 1, fp);
+			fflush(fp);
+			rewind(fp);
+			fl.l_type = F_UNLCK;
+			fcntl(fd, F_SETLKW, &fl);
+		}
+	}
+
+fail:
+	if (fp) fclose(fp);
+	if (conf) free(conf);
+	if (obj) cJSON_Delete(obj);
+}
+
 #if 0
 int main(int argc, char *argv[])
 {
@@ -520,17 +647,33 @@ int main(int argc, char *argv[])
 	int flag = -1;
 	int opt_index = 0;
 	int i;
+
+	if (!strcmp(basename(argv[0]), "cjson_env_sh")) {
+		if (argc < 2) {
+			return -1;
+		}
+		g_value_in_subnode = 1;
+		if (argc == 2) {
+			cJSON_Set_Env_Shell(argv[1], NULL);
+		} else {
+			cJSON_Set_Env_Shell(argv[1], argv[2]);
+		}
+		return 0;
+	}
+
 	enum OPT {
 		PRINT_ONLY,
 		UPDATE_BY_CONF,
 		UPDATE_BY_JSON,
 		SET_ENV_EXEC,
-	} opt_flag;
+		SET_ENV_SHELL,
+	};
 	const struct option long_options[] = {
 		{.name = "print-only", .has_arg = no_argument, .flag = &flag, .val = PRINT_ONLY},
 		{.name = "update-by-conf", .has_arg = no_argument, .flag = &flag, .val = UPDATE_BY_CONF},
 		{.name = "update-by-json", .has_arg = no_argument, .flag = &flag, .val = UPDATE_BY_JSON},
 		{.name = "set-env-exec", .has_arg = no_argument, .flag = &flag, .val = SET_ENV_EXEC},
+		{.name = "set-env-shell", .has_arg = no_argument, .flag = &flag, .val = SET_ENV_SHELL},
 		{.name = "value-in-submode", .has_arg = no_argument, .flag = 0, .val = 's'},
 		{},
 	};
@@ -579,6 +722,16 @@ int main(int argc, char *argv[])
 			return -1;
 		}
 		cJSON_Set_Env_Exec(args_num, args);
+		break;
+	case SET_ENV_SHELL:
+		if (args_num < 1) {
+			return -1;
+		}
+		if (args_num == 1) {
+			cJSON_Set_Env_Shell(args[0], NULL);
+		} else {
+			cJSON_Set_Env_Shell(args[0], args[1]);
+		}
 		break;
 	default:
 		Usage();
