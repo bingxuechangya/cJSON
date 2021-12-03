@@ -1,5 +1,9 @@
 cjson_opt: cJSON.c cJSON_Flatten_Opt.c
-	gcc $^ -lm -o $@
+	gcc -O3 $^ -lm -o $@
+	strip $@
+
+cjson_env_sh: cjson_opt
+	ln -f $^ $@
 
 .PHONY: test_getenv_wrap
 test_getenv_wrap: getenv_wrap.c getenv_test.c | cjson_opt

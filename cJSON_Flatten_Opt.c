@@ -178,7 +178,7 @@ static int cJSON_Parse_Value_Conf_Join(const char *type, char *conf, size_t conf
 		double value_double;
 		value_double = cJSON_GetNumberValue(c);
 		if (isnan(value_double) || isinf(value_double)) {
-			value_str = cJSON_GetStringValue(c);
+			value_str = cJSON_GetStringValue(c); // czm_printf("%s <=> %s\n", keychain, (value_str==NULL)?"":value_str);
 			len = snprintf(conf+len, conf_len-len, "%s=\"%s\"\n", keychain, (value_str==NULL)?"":value_str);
 		} else if (value_double == (long)value_double) {
 			len = snprintf(conf+len, conf_len-len, "%s=%ld\n", keychain, (long)value_double);
@@ -373,7 +373,7 @@ int cJSON_Set_Env_Exec(int args_num, char **args)
 	char *json_file;
 	char *prog;
 	char *prog_argv[args_num+1];
-	char prog_base_name[64];
+	char prog_base_name[64] = {0};
 
 	if (args_num < 2) {
 		return -1;
@@ -396,7 +396,8 @@ int cJSON_Set_Env_Exec(int args_num, char **args)
 	memcpy(&prog_argv[1], &args[1], args_num*sizeof(prog_argv[0]));
 	prog_argv[0] = prog_argv[1];
 
-	snprintf(prog_base_name, sizeof(prog_base_name), "%s", basename(prog));
+	strncpy(prog_base_name, basename(prog), sizeof(prog_base_name));
+	// snprintf(prog_base_name, sizeof(prog_base_name), "%s", basename(prog));
 	prog_argv[1] = prog_base_name;
 
 	prog_argv[args_num+1] = NULL;
@@ -604,7 +605,13 @@ int cJSON_Update_By_JSON(char *old_json_file, char *new_default_json_file, char 
 	conf_len = file_len2 > file_len1 ? file_len2 : file_len1;
 	// puts(cJSON_Print(old_obj));
 
-	char *conf = calloc(1, conf_len);
+	// arm 版本里，如果不对齐，free()就会报错。
+	char *conf = (char *)calloc(1, (conf_len+4095)&(~4095));
+	if (conf == NULL) {
+		cJSON_Delete(new_obj);
+		cJSON_Delete(old_obj);
+		return 0;
+	}
 
 	// 把旧的old_obj json压平导出到conf
 	cJSON_Parse_Value(conf, conf_len, old_obj, cJSON_Parse_Value_Conf_Join);
@@ -624,7 +631,8 @@ int cJSON_Update_By_JSON(char *old_json_file, char *new_default_json_file, char 
 
 void Usage()
 {
-	if (!strcmp(getenv("LANG"), "zh_CN.UTF-8")) {
+	char *lang = getenv("LANG");
+	if (lang && (!strcmp(lang, "zh_CN.UTF-8"))) {
 	printf(
 "用法: cjson_opt [-FLAGS] [--OPTIONS] ARGS...\n"
 "  可以很方便地 压平/更新/加载 json 配置。\n"
@@ -640,10 +648,10 @@ void Usage()
 "              和NEW_DEFAULT.json的格式，得出OLD.json\n"
 "    --set-env-exec FILE.json PROGRAM [ARGS...]\n"
 "              把FILE.json压平后的内容加载成为环境变量，\n"
-"              然后带参数ARGS...运行 PROGRAM。\n"
+"              然后带参数ARGS...运行 PROGRAM。(静态)\n"
 "    --set-env-shell FILE.json PROGRAM [ARGS...]\n"
 "              同 --set-env-exec，并且 json 内容变化可以通过tmpfile+\n"
-"              环境变量的方式被子进程的getenv重新获取到。\n"
+"              环境变量的方式被子进程的getenv重新获取到。(动态)\n"
 		   );
 		return;
 	}
@@ -662,10 +670,10 @@ void Usage()
 "              and the format of NEW_DEFAULT.json into OLD.json.\n"
 "    --set-env-exec FILE.json PROGRAM [ARGS...]\n"
 "              load flattened content of FILE.json as environment variables\n"
-"              then run PROGRAM with ARGS.\n"
+"              then run PROGRAM with ARGS.(static)\n"
 "    --set-env-shell FILE.json PROGRAM [ARGS...]\n"
 "              Same as --set-env-exec, but also the change of json can be updated into\n"
-"              subprogram by changing its environments, which can be got by getenv().\n"
+"              subprogram by changing its environments, which can be got by getenv().(dynamic)\n"
 		   );
 }
 

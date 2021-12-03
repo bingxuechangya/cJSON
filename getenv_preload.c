@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 char *getenv(const char *name)
@@ -15,16 +16,17 @@ char *getenv(const char *name)
 	char *config_fd_str = NULL;
 	char *key = NULL;
 	char *value = NULL;
-	static char cache[256];
 	static int fd = -1;
 	static FILE *fp = NULL;
+	static time_t update_time = 0;
+	struct stat attrib;
+	char *p = NULL;
 	static char* (*original_getenv_func)(const char *) = NULL;
 
 	// https://gist.github.com/Akdeniz/bed92f7efc01e35407130c567dc479ee
 	if(!original_getenv_func)
 		original_getenv_func = dlsym(RTLD_NEXT, "getenv");
 
-	memset(cache, 0, sizeof(cache));
 	if (name == NULL) goto end;
 
 	if (fd < 0) {
@@ -37,6 +39,17 @@ char *getenv(const char *name)
 			goto end;
 		}
 	}
+
+	if (fstat(fd, &attrib) < 0) {
+		goto end;
+	}
+	// 如果已经更新过了，就不再更新。
+	if (attrib.st_mtime <= update_time) {
+		goto end;
+	}
+	update_time = attrib.st_mtime;
+
+	// fp 指向临时文件，因为可由多个同级任务共用，所以文件为只读。
 	if (fp == NULL) {
 		fp	= fdopen(fd, "r");
 		if (fp == NULL) {
@@ -45,6 +58,7 @@ char *getenv(const char *name)
 	}
 
 	struct flock fl = {
+		// 写锁主要用来保护setenv，否则可以用读锁
 		.l_type = F_WRLCK,
 		// 下面3个指明锁区域
 		.l_whence = SEEK_SET,
@@ -63,15 +77,12 @@ char *getenv(const char *name)
 	rewind(fp);
 
 	while (fscanf(fp, "%256[^=]=%256s\n", key, value) == 2) {
-		if (strcmp(key, name)) {
-			continue;
+		p = value;
+		if (*p == '"') {
+			p++;
+			*(p+strlen(p)-1) = 0;
 		}
-		if (value[0] == '"') {
-			memcpy(cache, value+1, strlen(value)-2);
-		} else {
-			memcpy(cache, value, strlen(value));
-		}
-		goto unlock;
+		setenv(key, p, 1);
 	}
 
 unlock:
@@ -82,14 +93,7 @@ unlock:
 	fcntl(fd, F_SETLKW, &fl);
 
 end:
-	// 如果从头tmpfile里没拿到配置，那么就从环境变量里取
-	if (strlen(cache) == 0) {
-		value = original_getenv_func(name);
-		if (value) {
-			strncpy(cache, value, sizeof(cache));
-		}
-	}
-	return cache;
+	return original_getenv_func(name);
 }
 
 // int main(int argc, char *argv[])
